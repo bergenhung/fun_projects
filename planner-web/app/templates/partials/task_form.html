@@ -1,0 +1,95 @@
+<div class="modal-overlay" onclick="if (event.target === this) document.getElementById('modal-container').innerHTML = ''">
+    <div class="modal">
+        <h2>{{ "Edit Task" if task else "New Task" }}</h2>
+        <form
+            {% if task %}
+            hx-put="/tasks/{{ task.id }}"
+            {% else %}
+            hx-post="/tasks"
+            {% endif %}
+            hx-swap="none"
+        >
+            {% if not task %}<input type="hidden" name="date" value="{{ date_str }}" />{% endif %}
+
+            <label>Title
+                <input type="text" name="title" value="{{ task.title if task else '' }}" required autofocus />
+            </label>
+
+            <label>Notes
+                <textarea name="notes" rows="2">{{ task.notes if task and task.notes else '' }}</textarea>
+            </label>
+
+            <div class="field-row">
+                <label>Hour
+                    <select name="hour">
+                        {% for h in range(GRID_START_HOUR, GRID_END_HOUR) %}
+                        <option value="{{ h }}" {% if (task.start_hour if task else default_hour) == h %}selected{% endif %}>{{ hour_label(h) }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>Minute
+                    <select name="minute">
+                        {% for m in MINUTE_OPTIONS %}
+                        <option value="{{ m }}" {% if task and task.start_minute == m %}selected{% endif %}>:{{ "%02d" | format(m) }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <label>Duration
+                    <select name="duration">
+                        {% for d in DURATION_OPTIONS %}
+                        <option value="{{ d }}" {% if (task.duration_minutes if task else 60) == d %}selected{% endif %}>{{ duration_label(d) }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+            </div>
+
+            {% if not task %}
+            <fieldset class="recurrence-fieldset">
+                <legend>Repeat</legend>
+                <select name="frequency" id="frequency-select" onchange="document.getElementById('custom-days-field').style.display = this.value === 'custom' ? 'flex' : 'none'">
+                    <option value="never">Never</option>
+                    <option value="daily">Daily</option>
+                    <option value="weekdays">Weekdays</option>
+                    <option value="weekly">Weekly</option>
+                    <option value="custom">Custom</option>
+                </select>
+
+                <div id="custom-days-field" class="weekday-selector" style="display: none;">
+                    {% for label, value in [("M",0),("T",1),("W",2),("T",3),("F",4),("S",5),("S",6)] %}
+                    <label class="weekday-chip">
+                        <input type="checkbox" name="custom_days" value="{{ value }}" />
+                        <span>{{ label }}</span>
+                    </label>
+                    {% endfor %}
+                </div>
+
+                <label class="checkbox-row">
+                    <input type="checkbox" name="has_end_date" id="has-end-date" onchange="document.getElementById('end-date-field').style.display = this.checked ? 'block' : 'none'" />
+                    Ends on a date
+                </label>
+                <div id="end-date-field" style="display: none;">
+                    <input type="date" name="end_date" />
+                </div>
+            </fieldset>
+            {% elif task.series_id %}
+            <fieldset class="scope-fieldset">
+                <legend>Apply to</legend>
+                <label><input type="radio" name="scope" value="this" checked /> This occurrence only</label>
+                <label><input type="radio" name="scope" value="future" /> This and future occurrences</label>
+            </fieldset>
+            {% endif %}
+
+            <div class="modal-actions">
+                {% if task %}
+                <button type="button" class="danger-btn" hx-delete="/tasks/{{ task.id }}?scope=this" hx-swap="none">Delete</button>
+                {% if task.series_id %}
+                <button type="button" class="danger-btn" hx-delete="/tasks/{{ task.id }}?scope=future" hx-swap="none">Delete Future</button>
+                {% endif %}
+                {% endif %}
+                <span class="spacer"></span>
+                <button type="button" hx-get="/modal/close" hx-target="#modal-container" hx-swap="outerHTML">Cancel</button>
+                <button type="submit" class="primary-btn">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
