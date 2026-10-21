@@ -1,0 +1,75 @@
+<div class="toolbar">
+    <div class="nav-group">
+        <a class="icon-btn" href="/day/{{ prev_date }}" hx-get="/day/{{ prev_date }}/view" hx-target="#day-view" hx-push-url="/day/{{ prev_date }}">&lsaquo;</a>
+        <a class="icon-btn" href="/day/{{ next_date }}" hx-get="/day/{{ next_date }}/view" hx-target="#day-view" hx-push-url="/day/{{ next_date }}">&rsaquo;</a>
+        <input
+            type="date"
+            class="date-jump"
+            value="{{ date_str }}"
+            onchange="window.location.href = '/day/' + this.value"
+        />
+    </div>
+    <div class="title">{{ title_text }}</div>
+    <div class="nav-group">
+        {% if not is_today %}
+        <a class="text-btn" href="/day/{{ today_str }}" hx-get="/day/{{ today_str }}/view" hx-target="#day-view" hx-push-url="/day/{{ today_str }}">Today</a>
+        {% endif %}
+        <button class="icon-btn" hx-get="/tasks/new?date_str={{ date_str }}" hx-target="#modal-container" hx-swap="innerHTML">+</button>
+    </div>
+</div>
+
+<div class="grid-scroll">
+    <div class="grid-body" style="height: {{ (GRID_END_HOUR - GRID_START_HOUR) * HOUR_HEIGHT_PX }}px;">
+        {% for hour in hours %}
+        <div class="hour-row" style="height: {{ HOUR_HEIGHT_PX }}px;">
+            <div class="hour-label">{{ hour_label(hour) }}</div>
+            <div class="hour-line"></div>
+            {% if is_today and now_hour == hour %}
+            <div class="current-hour-tint"></div>
+            {% endif %}
+        </div>
+        {% endfor %}
+
+        {% if is_today and now_hour >= GRID_START_HOUR and now_hour < GRID_END_HOUR %}
+        <div class="now-line" style="top: {{ (now_hour - GRID_START_HOUR) * HOUR_HEIGHT_PX + (now_minute / 60 * HOUR_HEIGHT_PX) }}px; left: {{ HOUR_GUTTER_PX }}px;"></div>
+        {% endif %}
+
+        <div class="task-layer" style="left: {{ HOUR_GUTTER_PX }}px; right: 12px;">
+            {% for layout in layouts %}
+            {% set task = layout.task %}
+            {% set top_px = (task.start_hour - GRID_START_HOUR) * HOUR_HEIGHT_PX + (task.start_minute / 60 * HOUR_HEIGHT_PX) + 1 %}
+            {% set height_px = [(task.duration_minutes / 60 * HOUR_HEIGHT_PX) - 2, 28] | max %}
+            {% set compact = height_px < TWO_LINE_MIN_HEIGHT_PX %}
+            <div
+                class="task-block {% if task.is_completed %}completed{% endif %}"
+                style="
+                    top: {{ top_px }}px;
+                    height: {{ height_px }}px;
+                    left: calc({{ layout.column }} * (100% / {{ layout.column_count }}));
+                    width: calc(100% / {{ layout.column_count }} - 4px);
+                "
+                hx-post="/tasks/{{ task.id }}/toggle"
+                hx-swap="none"
+            >
+                <div class="task-content {% if compact %}compact{% endif %}">
+                    <div class="task-title-row">
+                        {% if task.series_id %}<span class="repeat-icon">&#8635;</span>{% endif %}
+                        <span class="task-title">{{ task.title }}</span>
+                        {% if compact %}<span class="task-time">{{ time_label(task.start_hour, task.start_minute) }}</span>{% endif %}
+                    </div>
+                    {% if not compact %}
+                    <div class="task-time">{{ time_label(task.start_hour, task.start_minute) }}</div>
+                    {% endif %}
+                </div>
+                <button
+                    class="edit-btn"
+                    hx-get="/tasks/{{ task.id }}/edit"
+                    hx-target="#modal-container"
+                    hx-swap="innerHTML"
+                    onclick="event.stopPropagation()"
+                >&#9998;</button>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>

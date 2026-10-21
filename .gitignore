@@ -1,3 +1,8 @@
-planner/Planner/Assets.xcassets/.DS_Store
-planner/Planner/.DS_Store
-.DS_Store
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# Environments
+.venv/
+.claude/
+.vscode/
+
