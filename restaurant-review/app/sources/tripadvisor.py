@@ -3,8 +3,9 @@ a few recent reviews per restaurant.
 
 Cost control. Terra bills per "entity": every location a search returns counts as one, and each
 details or reviews call counts as one. Errors aren't billed. So this module:
-- finds the restaurant with a nearby search around Google's coordinates, asking for at most
-  NEARBY_SIZE results;
+- finds the restaurant by name (narrowed to its postal code), falling back to a nearby search
+  around Google's coordinates for names written differently on each site, asking for at most
+  SEARCH_SIZE results each time;
 - remembers the Tripadvisor ID for each Google place for 30 days (no-matches for 7), so later
   lookups skip the search and cost 2 entities (details + reviews);
 - stops for the rest of the UTC day once TRIPADVISOR_DAILY_ENTITY_LIMIT is reached, or as soon as
@@ -18,6 +19,7 @@ Location and Review objects, so parsing below accepts the likely variants. The f
 of each kind is logged ("tripadvisor sample response") so any mismatch is easy to spot and fix.
 """
 import logging
+import re
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -28,7 +30,9 @@ from app.models import Market, Place, Review
 
 log = logging.getLogger(__name__)
 
-NEARBY_SIZE = 3            # each returned location is billed, so keep this small
+SEARCH_SIZE = 3            # each returned location is billed, so keep this small
+NAME_SEARCH_MAX_KM = 1.0   # a same-named result further than this from Google's pin is another branch
+COUNTRY = {Market.us: "US", Market.tw: "TW"}
 SEARCH_RADIUS_KM = 0.3
 NAME_MATCH = 0.6
 # When names differ by language (Google: 鼎泰豐, Tripadvisor: Din Tai Fung), accept the
@@ -103,7 +107,7 @@ class Tripadvisor:
             log.warning("tripadvisor call failed", extra={"kind": kind, "status": resp.status_code, "body": resp.text[:300]})
             return None
         data = resp.json()
-        billed = len(data.get("data", [])) if kind == "nearby" else 1
+        billed = len(data.get("data", [])) if kind in ("nearby", "search") else 1
         self._spent_today += billed
         if kind not in self._sampled:
             self._sampled.add(kind)
@@ -111,52 +115,77 @@ class Tripadvisor:
         return data
 
     async def find(self, google_place_id: str, name: str, lat: float | None, lng: float | None,
-                   market: Market) -> Place | None:
-        """Tripadvisor listing for a restaurant Google already found, or None."""
+                   market: Market, address: str = "") -> tuple[Place | None, str]:
+        """Tripadvisor listing for a restaurant Google already found.
+        Returns (place, status); status is "matched", "no_match", "limit" or "error"."""
         try:
-            hit = await self._locate(google_place_id, name, lat, lng, market)
-            if not hit:
-                return None
-            location_id, location = hit
+            status, location_id, location = await self._locate(google_place_id, name, lat, lng, market, address)
+            if status != "matched":
+                return None, status
             if location is None or _rating(location) is None:
                 location = await self._get(f"/locations/{location_id}", self._locale_params(market), 1, "details")
                 if not location:
-                    return None
+                    return None, "error"
             place = _to_place(location_id, location)
             reviews = await self._get(f"/locations/{location_id}/reviews",
                                       [("language", REVIEW_LANGUAGE[market]), ("size", "10")], 1, "reviews")
             if reviews:
                 place.reviews = [r for r in (_to_review(x) for x in reviews.get("data", [])) if r]
-            return place
+            return place, "matched"
         except BudgetExhausted:
             log.warning("tripadvisor skipped: daily limit reached", extra={"limit": self.daily_limit})
-            return None
+            return None, "limit"
 
     def _locale_params(self, market: Market) -> list[tuple[str, str]]:
         return [("locale", loc) for loc in NAME_LOCALES[market]] if self._locale_ok else []
 
-    async def _locate(self, google_place_id, name, lat, lng, market) -> tuple[str, dict | None] | None:
-        key = f"ta-id|{google_place_id}"
-        if cached := await self.store.get_cached(key):
-            return (cached["location_id"], None) if cached.get("location_id") else None
-        if lat is None or lng is None:
-            return None
-        params = [("lat", str(lat)), ("lon", str(lng)), ("radius", str(SEARCH_RADIUS_KM)), ("unit", "KM"),
-                  ("category", "RESTAURANT"), ("sort", "distance,asc"), ("size", str(NEARBY_SIZE))]
-        found = await self._get("/locations/nearby", params + self._locale_params(market), NEARBY_SIZE, "nearby")
+    async def _search(self, path: str, params: list[tuple[str, str]], market: Market, kind: str) -> dict | None:
+        found = await self._get(path, params + self._locale_params(market), SEARCH_SIZE, kind)
         if found is None and self._locale_ok and self._last_status in (400, 422):
             # If Terra doesn't accept the locale format, stop sending it and retry once.
             self._locale_ok = False
-            found = await self._get("/locations/nearby", params, NEARBY_SIZE, "nearby")
+            found = await self._get(path, params, SEARCH_SIZE, kind)
+        return found
+
+    async def _locate(self, google_place_id, name, lat, lng, market, address) -> tuple[str, str, dict | None]:
+        """Returns (status, location_id, location-if-already-fetched)."""
+        # Per market too: a lookup made with the wrong country (and found nothing) mustn't stick.
+        key = f"ta-id|{market.value}|{google_place_id}"
+        if cached := await self.store.get_cached(key):
+            return ("matched", cached["location_id"], None) if cached.get("location_id") else ("no_match", "", None)
+
+        best, errored = None, False
+        # 1) By name, narrowed to the postal code. Ranking is by name, so a restaurant inside a
+        #    busy mall or food court is still found.
+        postal = postal_code(address)
+        params = [("query", name), ("search_type", "NAME"), ("category", "RESTAURANT"),
+                  ("country_code", COUNTRY[market]), ("size", str(SEARCH_SIZE))]
+        if postal:
+            params.append(("postal_code", postal))
+        found = await self._search("/locations/search", params, market, "search")
         if found is None:
-            return None  # an error, not a confirmed no-match: don't remember it
-        best = match(name, found.get("data", []))
+            errored = True
+        else:
+            best = match_by_name(name, found.get("data", []), lat, lng, narrowed=bool(postal))
+
+        # 2) Nearby, for names written differently on each site (鼎泰豐 vs Din Tai Fung).
+        if not best and lat is not None and lng is not None:
+            params = [("lat", str(lat)), ("lon", str(lng)), ("radius", str(SEARCH_RADIUS_KM)), ("unit", "KM"),
+                      ("category", "RESTAURANT"), ("sort", "distance,asc"), ("size", str(SEARCH_SIZE))]
+            found = await self._search("/locations/nearby", params, market, "nearby")
+            if found is None:
+                errored = True
+            else:
+                best = match(name, found.get("data", []))
+
         location_id = str(best["id"]) if best and best.get("id") is not None else ""
         if not location_id:
-            log.info("tripadvisor no match", extra={"restaurant": name})
+            if errored:
+                return "error", "", None  # not a confirmed no-match, so don't remember it
+            log.info("tripadvisor no match", extra={"restaurant": name, "postal_code": postal})
         await self.store.set_cached(key, {"location_id": location_id},
                                     LOCATION_ID_TTL_HOURS if location_id else NO_MATCH_TTL_HOURS)
-        return (location_id, best) if location_id else None
+        return ("matched", location_id, best) if location_id else ("no_match", "", None)
 
 
 # ---------- parsing ----------
@@ -177,6 +206,61 @@ def match(name: str, results: list[dict]) -> dict | None:
         if names and not any(_has_cjk(n) == _has_cjk(name) for n in names):
             return close[0]
     return None
+
+
+def match_by_name(name: str, results: list[dict], lat: float | None, lng: float | None,
+                  narrowed: bool) -> dict | None:
+    """Best name match from a name search. Chains have many branches, so the result must also be
+    near Google's pin when Tripadvisor gives coordinates, or the search must have been narrowed to
+    the restaurant's postal code with only one same-named result."""
+    named = [(max((similarity(name, n) for n in _names(r)), default=0.0), r) for r in results]
+    named = [(score, r) for score, r in named if score >= NAME_MATCH]
+    if not named:
+        return None
+    located = []
+    for score, r in named:
+        c = _coords(r)
+        if c and lat is not None and lng is not None:
+            km = _km(lat, lng, *c)
+            if km <= NAME_SEARCH_MAX_KM:
+                located.append((km, -score, r))
+    if located:
+        return min(located, key=lambda t: (t[0], t[1]))[2]
+    if any(_coords(r) for _, r in named):
+        return None  # coordinates known, and none of the same-named places is close: other branches
+    if narrowed and len(named) == 1:
+        return named[0][1]
+    return None
+
+
+def _coords(loc: dict) -> tuple[float, float] | None:
+    for obj in (loc.get("coordinates"), loc.get("geo"), loc.get("location"), loc.get("position"), loc):
+        if isinstance(obj, dict):
+            la = _num(obj.get("latitude", obj.get("lat")))
+            lo = _num(obj.get("longitude", obj.get("lon", obj.get("lng"))))
+            if la is not None and lo is not None:
+                return la, lo
+    return None
+
+
+def _km(lat1, lng1, lat2, lng2) -> float:
+    from math import asin, cos, radians, sin, sqrt
+    dlat, dlng = radians(lat2 - lat1), radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return 6371 * 2 * asin(sqrt(a))
+
+
+def postal_code(address: str) -> str:
+    """US ZIP ("Santa Clara, CA 95050, USA") or Taiwan postal code ("110台北市…", "Taipei City, Taiwan 110")."""
+    if not address:
+        return ""
+    if m := re.search(r"\b[A-Z]{2} (\d{5})(?:-\d{4})?\b", address):
+        return m.group(1)
+    if m := re.match(r"\s*(\d{3,6})(?=\D)", address):
+        return m.group(1)
+    if m := re.search(r"Taiwan (\d{3,6})\b", address):
+        return m.group(1)
+    return ""
 
 
 def _has_cjk(text: str) -> bool:

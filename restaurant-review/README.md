@@ -2,8 +2,12 @@
 
 A small web service that puts a restaurant's ratings from several review sites side by side. It can either:
 
-- **Verify one restaurant**: "Is this place actually good?"
-- **List top options**: the best N restaurants for a location, with cuisine, price and minimum-rating filters.
+- **Verify one restaurant**: "Is this place actually good?" The Location can be a city, district, street or landmark ("Xinyi District, Taipei", "Taipei 101"). When a chain has several branches, the one closest to that location is shown, and the others are listed as one-click links.
+- **Restaurants near an address**: the N restaurants closest to an address (default 3, within 1 km), with optional cuisine, price and minimum-rating filters.
+
+  The starting point can be an **address**, **cross streets** ("1st St" & "Mission St", San Francisco, or 忠孝東路 & 敦化南路, 台北), or a **point**: click the map to drop a pin (drag it to adjust), search for a spot, or press **Use my location**. The map loads only when that option is chosen, so other page views don't count as Google map loads.
+
+In both modes Google Maps is the starting point: the restaurants shown are the ones Google returns. Each is then looked up directly on Tripadvisor and checked against the Michelin Guide list, with links to search the Michelin Guide and Yelp sites yourself.
 
 Each result row shows the all-time rating per site, a combined all-time rating, a last-3-months rating, the Michelin status, and the dishes reviewers mention most.
 
@@ -35,15 +39,16 @@ You can also force a market with `market=us` or `market=tw`.
 | `GET /` | Search page with autocomplete (HTML) |
 | `GET /v1/autocomplete?q=&kind=restaurant\|location&session=` | Suggestions while typing (min 2 characters) |
 | `GET /v1/verify?name=&location=` or `?place_id=` | One restaurant; `place_id` comes from autocomplete and skips name matching |
-| `GET /v1/top?location=&cuisine=&price=&min_rating=&limit=` | Top options (limit 1–10, default 5) |
+| `GET /v1/locate?address=` | Coordinates for an address or cross streets (used by the map picker) |
+| `GET /v1/nearby?address=&count=&within_km=&cuisine=&price=&min_rating=&sort=` or `?lat=&lng=…` | The `count` (1–10, default 3) restaurants closest to an address, within `within_km` (default 1, max 10). `sort` is `distance` (default) or `rating`. `place_id` and `session` come from address autocomplete. |
 | `GET /docs` | Interactive OpenAPI docs |
 | `GET /healthz` | Health check |
 
-Add `format=html` to `/v1/verify` or `/v1/top` for a rendered page: a map with numbered pins plus the table. Clicking a row opens its pin, and clicking a pin highlights its row. `price` takes `$$`, `$-$$$` or `1,2`.
+Add `format=html` to `/v1/verify` or `/v1/nearby` for a rendered page: a map with numbered pins plus the table. In near-an-address mode the map also shows the address (dark pin) and the distance limit (circle), and the table gets a distance column. Clicking a row opens its pin, and clicking a pin highlights its row. `price` takes `$$`, `$-$$$` or `1,2`.
 
 ```
 /v1/verify?name=Din%20Tai%20Fung&location=Taipei
-/v1/top?location=Capitol%20Hill,%20Seattle&cuisine=ramen&price=$-$$&min_rating=4&format=html
+/v1/nearby?address=2855%20Stevens%20Creek%20Blvd,%20Santa%20Clara&count=3&within_km=1&format=html
 ```
 
 Example JSON row (trimmed):
@@ -69,20 +74,30 @@ Example JSON row (trimmed):
 ## How the numbers work
 
 - **All time**: each site's own rating. The combined figure weights each site by its review count.
-- **Ranking** (`score`): a Bayesian average, so a 5.0 from 4 reviews doesn't beat a 4.6 from 1,800.
+- **Order**: near-an-address results are closest first by default. With `sort=rating` they're ordered by `score`, a Bayesian average, so a 5.0 from 4 reviews doesn't beat a 4.6 from 1,800.
 - **Last 3 months**: the review APIs return only a few reviews per call (Google and Tripadvisor up to 5 each). The service saves every review it sees in Firestore, so this column is thin at first and fills in as restaurants get looked up again. `low_confidence` is true under 5 reviews.
-- **Top dishes**: phrases like "try the …", "the … was amazing", "必點…", "…超好吃" counted across saved reviews. It's an estimate; `app/dishes.py` is the one place to change if you later use an LLM instead.
+- **Top dishes**: phrases like "try the …", "the … was amazing", "必點…", "…超好吃" counted across saved reviews. English phrases are kept only if they contain a food word (pizza, salad, omakase, duck…) and no word about the visit (service, menu, place…), so things like "version" or "annoyed face" are dropped. It's an estimate; `app/dishes.py` is the one place to change if you later use an LLM instead.
+- **Hours and price**: from Google. "Open now" is worked out in the restaurant's own time zone each time a page is shown, so cached results stay correct. The price range is Google's typical spend per person ("$20–30"). Restaurants Google marks as permanently closed are left out of near-an-address results.
 - **Caching**: identical searches are reused for 6 hours (`CACHE_TTL_HOURS`) to save API costs.
 
 ## Autocomplete and map
 
-- **Autocomplete** goes through this service (`/v1/autocomplete`), so the Places key never reaches the browser. Typing waits 250 ms between keystrokes, suggestions are cached for an hour, and each typing session sends a session token, which Google bills more cheaply when it ends in a lookup. Picking a restaurant passes its exact Google place ID to `/v1/verify`, so there's no guessing which "Joe's" was meant. Works with the keyboard (arrows, Enter, Escape) and screen readers.
+- **Autocomplete** goes through this service (`/v1/autocomplete`), so the Places key never reaches the browser. Typing waits 250 ms between keystrokes, suggestions are cached for an hour, and each typing session sends a session token, which Google bills more cheaply when it ends in a lookup. Picking a restaurant passes its exact Google place ID to `/v1/verify`, so there's no guessing which "Joe's" was meant. Works with the keyboard (arrows, Enter, Escape) and screen readers. Restaurant suggestions favour the area in the Location field when it's filled in (otherwise Google favours wherever you are, which may be another branch). If a picked restaurant turns out to be more than 50 km from the Location you typed, the app searches for that name in that location instead, and editing Location after picking clears the pick. The market (US or Taiwan) always follows the restaurant's own address.
 - **Map** needs a second key, because a map key is visible in the page by design:
   1. APIs & Services → enable *Maps JavaScript API* → Credentials → Create API key.
   2. Restrict it: *Application restrictions* → Websites, add `http://localhost:8000/*` and your Cloud Run URL; *API restrictions* → Maps JavaScript API only.
   3. Set `GOOGLE_MAPS_BROWSER_KEY`. Optionally create a Map ID (Map management) and set `GOOGLE_MAP_ID`; `DEMO_MAP_ID` works for testing.
 
-  Without the key the page shows the table and a one-line note instead of the map. Each page view with a map counts as a map load on your Google bill (there's a free monthly allowance; check the current pricing page).
+  The map has zoom (+/−) and full-screen buttons, and a **Show all** button that zooms back out to every result. Scroll-wheel zoom needs Ctrl (⌘ on Mac) so the page still scrolls normally; on phones, pinch with two fingers.
+
+  Without the key the page shows the table and a one-line note instead of the map.
+- **Directions**: every row and map pin has a *Directions* link that opens Google Maps directions to the restaurant from the viewer's current location, with driving, transit, walking and cycling options (on a phone it opens the Maps app). It's a plain link, so it needs no extra API and costs nothing. Each page view with a map counts as a map load on your Google bill (there's a free monthly allowance; check the current pricing page).
+
+### Cross streets and dropped pins: enable the Geocoding API
+
+Google's place search often can't find an intersection, so cross streets use Google's **Geocoding API**, which also turns a dropped pin into a readable address. To turn it on: APIs & Services → Library → **Geocoding API** → Enable, then edit your server key (the Places one) and tick **Geocoding API** under API restrictions as well.
+
+If it isn't enabled, the app still works: cross streets fall back to place search (less reliable), and a dropped pin is labelled with its coordinates. The terminal logs `google geocoding unavailable` when this happens. Geocoding is billed separately per request, with its own free allowance; lookups are remembered for a day.
 
 ## Run locally
 
@@ -105,6 +120,7 @@ pytest                        # tests mock every external API; no keys needed
 | `ModuleNotFoundError: No module named 'app'` | Run commands from the project folder (the one containing `app/`). |
 | `ModuleNotFoundError: No module named 'fastapi'` (or similar) | The virtual environment isn't active, or dependencies aren't installed: `source .venv/bin/activate` then `pip install -r requirements-dev.txt`. |
 | `503 ... GOOGLE_PLACES_API_KEY is not set` | Add the key to `.env` and restart uvicorn. |
+| `404 No restaurant matching …` | The message lists what Google returned. If the restaurant is there under another name, search that name, or pick it from the suggestions while typing. |
 | `502 A review site didn't respond properly` | Check the terminal log for `google places search failed`; a 403 there usually means *Places API (New)* isn't enabled for the key's project, or the key is restricted to other APIs. |
 | `[Errno 48] Address already in use` | Another server is on port 8000. Stop it, or use `uvicorn app.main:app --reload --port 8001`. |
 
@@ -141,17 +157,20 @@ Tripadvisor retired its old Content API on August 31, 2026; new keys come from i
 **Cost.** Terra bills per *entity*: every location a search returns is one, and each details or reviews call is one. Errors aren't billed. At the time of writing the first 1,000 entities are free **once per account (not monthly)**, then about $0.015 each, getting cheaper with volume. Check the pricing shown when you sign up.
 
 **How this project keeps that small**
-- Finds each restaurant with a *nearby* search around Google's coordinates, asking for at most 3 results.
+- Finds each restaurant by **name**, narrowed to its postal code and country, asking for at most 3 results. A same-named result must be within 1 km of Google's pin, so another branch of a chain isn't picked. Searching by name means a restaurant inside a mall or food court is still found even when other places are nearer the pin.
+- Falls back to a *nearby* search (3 results) only when the name search finds nothing, mainly for names written differently on each site (鼎泰豐 vs Din Tai Fung).
 - Remembers the Tripadvisor match per Google place for 30 days (no-matches for 7), so repeat lookups cost 2 entities.
-- In "top options" searches, checks Tripadvisor only for the rows that will be shown (`limit`, default 5), not the whole shortlist.
+- In near-an-address mode, only the restaurants shown (`count`, default 3) are looked up.
 - Caches whole searches for `CACHE_TTL_HOURS`.
 - Stops for the rest of the UTC day after `TRIPADVISOR_DAILY_ENTITY_LIMIT` entities (default 30 locally, 10 per instance on Cloud Run), or as soon as Tripadvisor returns 429. Rows then show Google and Michelin only.
 
-Rough worst case: a fresh "top 5" search costs about 25 entities; with the default local cap of 30 a day, that's at most about $0.45 a day once the free allowance is used. The cap is counted in memory per running instance and resets on restart.
+Rough worst case: a fresh search for 3 nearby restaurants costs about 15 entities (more if several need the nearby fallback); with the default local cap of 30 a day, that's at most about $0.45 a day once the free allowance is used. The cap is counted in memory per running instance and resets on restart.
 
 **Taiwan.** Reviews are requested in their original language (`language=primary`), so local Chinese reviews count. Google often returns Chinese names and Tripadvisor English ones, so when names are in different scripts the closest listing within 30 m is accepted if nothing else is nearby. Two same-script names that don't match are never paired.
 
 **Display rules.** Wherever its rating appears, Tripadvisor requires its bubble-rating image, a link to the listing and a credit. The results page shows all three; if you build your own front end on the JSON, use `rating_image_url` and `url` the same way.
+
+**Why a cell is empty.** The Tripadvisor column says *not found* (no matching listing), *not checked (daily limit)*, *couldn't check (see log)* (an error, such as a rejected key) or *not checked* (the row wasn't looked up). The JSON has the same in each row's `source_status`.
 
 **First run.** Terra's public reference doesn't list every response field, so the parser accepts the likely variants, and the first response of each kind is logged as `tripadvisor sample response`. If Tripadvisor ratings don't appear, that log line shows what came back.
 

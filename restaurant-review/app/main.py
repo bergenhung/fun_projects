@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.config import ENV_FILE, get_settings
+from app.hours import refresh as refresh_hours
 from app.logging_setup import request_id_var, setup_logging, trace_var
 from app.models import Market, ResultTable, Suggestion
 from app.render import search_page, table_page
@@ -55,7 +56,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Cross-site restaurant review",
     version="0.1.0",
-    description="Compare a restaurant's ratings across review sites, or find top options with filters.",
+    description=(
+        "Two modes, both starting from Google Maps: check one restaurant (/v1/verify), or list the "
+        "restaurants closest to an address (/v1/nearby). Each restaurant Google returns is then looked "
+        "up on Tripadvisor and checked against the Michelin Guide list."
+    ),
     lifespan=lifespan,
 )
 
@@ -125,6 +130,7 @@ def parse_min_rating(value: str | None) -> float | None:
 
 
 def respond(table: ResultTable, fmt: str):
+    refresh_hours(table)  # open/closed as of now, even for a cached result
     if fmt != "html":
         return table
     s = get_settings()
@@ -145,7 +151,8 @@ async def run(coro):
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def home():
-    return search_page()
+    s = get_settings()
+    return search_page(s.google_maps_browser_key, s.google_map_id)
 
 
 @app.get("/healthz", include_in_schema=False)
@@ -157,10 +164,11 @@ async def healthz():
 async def autocomplete(
     request: Request,
     q: str = Query(..., min_length=2, max_length=100, description="What the person has typed so far"),
-    kind: Literal["restaurant", "location"] = "restaurant",
+    kind: Literal["restaurant", "location", "address"] = "restaurant",
     session: str | None = Query(None, max_length=64, description="Random ID per typing session (lowers Google billing)"),
+    near: str | None = Query(None, max_length=120, description="Favour suggestions near this place, e.g. 'Taipei'"),
 ):
-    return await run(request.app.state.service.autocomplete(q, kind, session))
+    return await run(request.app.state.service.autocomplete(q, kind, session, near))
 
 
 @app.get("/v1/verify", response_model=ResultTable, summary="Check one restaurant across review sites")
@@ -181,20 +189,46 @@ async def verify(
     return respond(table, format)
 
 
-@app.get("/v1/top", response_model=ResultTable, summary="Top restaurants for a location, with filters")
-async def top(
+@app.get("/v1/nearby", response_model=ResultTable, summary="The restaurants closest to an address")
+async def nearby(
     request: Request,
-    location: str = Query(..., min_length=1, max_length=120, examples=["Mission District, San Francisco"]),
+    address: str = Query("", max_length=200, examples=["2855 Stevens Creek Blvd, Santa Clara, CA"]),
+    place_id: str | None = Query(None, max_length=200, description="The address picked from /v1/autocomplete"),
+    session: str | None = Query(None, max_length=64, description="The autocomplete session ID, if any"),
+    count: int = Query(3, ge=1, le=10, description="How many restaurants"),
+    within_km: float = Query(1.0, gt=0, le=10, description="Only restaurants within this distance"),
     cuisine: str | None = Query(None, max_length=60, examples=["ramen"]),
     price: str | None = Query(None, description="$, $$, $-$$$ or 1,2", examples=["$$"]),
     min_rating: str | None = Query(None, description="1.0 to 5.0", examples=["4.0"]),
-    limit: int = Query(5, ge=1, le=10),
-    market: Market | None = Query(None, description="us or tw; detected from location if omitted"),
+    sort: Literal["distance", "rating"] = Query("distance", description="Order of the results"),
+    lat: float | None = Query(None, ge=-90, le=90, description="Start from this point (a map pin or your location)"),
+    lng: float | None = Query(None, ge=-180, le=180),
+    market: Market | None = Query(None, description="us or tw; detected from the address if omitted"),
     format: Literal["json", "html"] = "json",
 ):
+    if (lat is None) != (lng is None):
+        raise HTTPException(422, "Give both lat and lng.")
+    if not address.strip() and not place_id and lat is None:
+        raise HTTPException(422, "Give an address or cross streets, a place_id from autocomplete, or lat and lng.")
     table = await run(
-        request.app.state.service.top(
-            location, market, cuisine or None, parse_price(price), parse_min_rating(min_rating), limit
+        request.app.state.service.nearby(
+            address.strip(), market, count, within_km, (cuisine or "").strip() or None, parse_price(price),
+            parse_min_rating(min_rating), sort, place_id or None, session or None, lat, lng,
         )
     )
     return respond(table, format)
+
+
+@app.get("/v1/locate", summary="Coordinates for an address or cross streets (used by the map picker)")
+async def locate(
+    request: Request,
+    address: str = Query("", max_length=200),
+    place_id: str | None = Query(None, max_length=200),
+    session: str | None = Query(None, max_length=64),
+):
+    if not address.strip() and not place_id:
+        raise HTTPException(422, "Give an address or a place_id.")
+    found = await run(request.app.state.service.locate_point(address.strip(), place_id or None, session or None))
+    if not found:
+        raise HTTPException(404, f"Couldn't find '{address}'.")
+    return {"lat": found[0], "lng": found[1], "label": found[2]}

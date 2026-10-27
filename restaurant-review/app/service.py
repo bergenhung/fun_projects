@@ -7,8 +7,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
 from app.dishes import extract_dishes
-from app.matching import similarity
-from app.models import Link, Market, Place, RecentRating, Review, ResultRow, ResultTable, SourceRating
+from app.matching import has_cjk, similarity
+from app.models import Alternative, Center, Link, Market, Place, RecentRating, Review, ResultRow, ResultTable, SourceRating
 from app.sources.google_places import GooglePlaces
 from app.sources.michelin import Michelin
 from app.sources.tripadvisor import Tripadvisor
@@ -22,6 +22,10 @@ TW_HINTS = (
     "高雄", "新竹", "桃園", "基隆", "台東", "臺東", "花蓮", "宜蘭",
 )
 RECENT_DAYS = 90
+REGION = {Market.us: "US", Market.tw: "TW"}
+BRANCH_SEARCH_RADIUS_M = 20000  # look for branches around the typed location
+MAX_ALTERNATIVES = 4
+PICKED_PLACE_MAX_KM = 50  # a picked suggestion further than this from the typed location is another branch
 MIN_RECENT_FOR_CONFIDENCE = 5
 PRIOR_MEAN = 3.8   # Bayesian prior: a typical restaurant rating
 PRIOR_WEIGHT = 50  # how many "virtual reviews" the prior counts as
@@ -35,10 +39,17 @@ class SourceUnavailable(Exception):
     pass
 
 
+def market_at(lat: float, lng: float) -> Market:
+    """Taiwan (including Penghu, Kinmen and Matsu) by coordinates; anything else is US."""
+    return Market.tw if 21.8 <= lat <= 26.5 and 118.0 <= lng <= 122.2 else Market.us
+
+
 def detect_market(location: str, explicit: Market | None) -> Market:
     if explicit:
         return explicit
     loc = (location or "").lower()
+    if any(h in loc for h in ("usa", "united states", "美國", "美国")):
+        return Market.us  # an explicit country wins over a Taiwan-sounding street or dish name
     return Market.tw if any(h in loc for h in TW_HINTS) else Market.us
 
 
@@ -65,6 +76,7 @@ class ReviewService:
         self.settings = settings
         # Popular prefixes ("ram", "rame") repeat a lot; reuse suggestions for an hour.
         self._suggest_cache: dict[tuple[str, str], tuple[float, list[dict]]] = {}
+        self._locate_cache: dict[tuple[str, str], tuple[float, tuple[float, float, str]]] = {}
 
     def _sources(self, market: Market) -> list:
         """US: Google, Tripadvisor, Yelp (only with a paid key), Michelin.
@@ -105,65 +117,193 @@ class ReviewService:
             # Picked from autocomplete: no guessing which restaurant was meant.
             best = await self.google.details(place_id, market, session_token)
             if not best:
+                if name:
+                    # Fall back to a name search rather than giving up.
+                    log.info("place id lookup failed; searching by name", extra={"place_id": place_id})
+                    return await self.verify(name, location, explicit, None, None)
                 raise NotFound("That restaurant couldn't be found. Try searching by name.")
-            if not explicit and not location and detect_market(best.address, None) != market:
-                market = detect_market(best.address, None)
+            if location and name and best.lat is not None:
+                # A suggestion can be for another branch (Google favours the person's own area),
+                # so make sure the picked restaurant is actually where they said.
+                try:
+                    area = await self._locate(location)
+                except Exception:
+                    area = None
+                if area and distance_km(area[0], area[1], best.lat, best.lng) > PICKED_PLACE_MAX_KM:
+                    log.info("picked restaurant is far from the location; searching by name there",
+                             extra={"picked": best.address, "location": location})
+                    return await self.verify(name, location, explicit, None, None)
+            # The restaurant's own address decides the market (language, sources), not the typed text.
+            actual = detect_market(best.address, None)
+            if not explicit and actual != market:
+                market = actual
                 best = await self.google.details(place_id, market) or best  # re-fetch in the local language
             query["name"] = query["name"] or best.name
         else:
             if not name:
                 raise NotFound("Enter a restaurant name.")
-            candidates = await self.google.search(f"{name} {location}".strip(), market, limit=5)
-            best = max(candidates, key=lambda p: similarity(name, p.name), default=None)
-            if not best or similarity(name, best.name) < 0.6:
-                raise NotFound(f"No restaurant matching '{name}' near '{location}'.")
+            text = f"{name} {location}".strip()
+            # Put the location on the map first (a city, district, street or landmark), so that when
+            # a chain has several branches the one closest to it is chosen.
+            area = None
+            if location:
+                try:
+                    area = await self._locate(location, region=REGION[market])
+                except Exception:
+                    log.warning("couldn't locate the location; using text search only", extra={"location": location})
+            center = area[:2] if area else None
+            search = dict(limit=10, center=center, radius_m=BRANCH_SEARCH_RADIUS_M) if center else dict(limit=5)
+            candidates = await self.google.search(text, market, **search)
+            matches = _matches_by_name(name, candidates)
+            if not matches and candidates and not any(has_cjk(c.name) == has_cjk(name) for c in candidates):
+                # Typed "Din Tai Fung" but Google answered in Chinese ("鼎泰豐"), or the reverse.
+                # Ask again in the typed name's language, match there, then keep the local-language
+                # version of the same places (their names and reviews suit the market better).
+                other = await self.google.search(text, market, language="zh-TW" if has_cjk(name) else "en", **search)
+                by_id = {c.source_id: c for c in candidates}
+                matches = [by_id.get(m.source_id, m) for m in _matches_by_name(name, other)]
+                if matches:
+                    log.info("matched across languages", extra={"typed": name, "matched": matches[0].name})
+            if center:
+                matches.sort(key=lambda p: distance_km(*center, p.lat, p.lng) if p.lat is not None else 1e9)
+            best = matches[0] if matches else None
+            alternatives = [
+                Alternative(name=m.name, address=m.address, place_id=m.source_id,
+                            distance_km=round(distance_km(*center, m.lat, m.lng), 2) if center and m.lat is not None else None)
+                for m in matches[1:1 + MAX_ALTERNATIVES]
+            ]
+            if not best:
+                seen = [f"{c.name} ({c.address})" for c in candidates[:3]]
+                log.info("verify no match", extra={"typed": name, "location": location, "market": market.value,
+                                                   "google_returned": seen})
+                found = f" Google returned: {'; '.join(seen)}." if seen else " Google returned no restaurants."
+                raise NotFound(
+                    f"No restaurant matching '{name}' near '{location}'.{found} "
+                    "Try picking it from the suggestions as you type."
+                )
         row = await self._build_row(best, market)
         table = self._table(query, market, [row])
+        if not place_id:
+            table.alternatives = alternatives
         await self.store.set_cached(cache_key, table.model_dump(mode="json"), self.settings.cache_ttl_hours)
         return table
 
-    async def top(
+    async def nearby(
         self,
-        location: str,
+        address: str,
         market: Market | None,
+        count: int = 3,
+        within_km: float = 1.0,
         cuisine: str | None = None,
         price_levels: list[int] | None = None,
         min_rating: float | None = None,
-        limit: int = 5,
+        sort: str = "distance",
+        place_id: str | None = None,
+        session_token: str | None = None,
+        lat: float | None = None,
+        lng: float | None = None,
     ) -> ResultTable:
-        market = detect_market(location, market)
+        """The `count` restaurants closest to a starting point, found on Google, each then looked up
+        on Tripadvisor and Michelin. The start is an address, cross streets ("1st St & Mission St,
+        San Francisco"), or a point on the map / the person's location (lat, lng)."""
         self._require_google()
-        query = {"location": location, "cuisine": cuisine, "price": price_levels, "min_rating": min_rating, "limit": limit}
-        cache_key = f"top|{market.value}|{sorted((k, str(v).lower()) for k, v in query.items())}"
+        if lat is not None and lng is not None:
+            market = market or market_at(lat, lng)
+            label = await self._describe_point(lat, lng, market) or address or f"the pin at {lat:.5f}, {lng:.5f}"
+        else:
+            located = await self._locate(address, place_id, session_token)
+            if not located:
+                raise NotFound(f"Couldn't find '{address}'. Try picking it from the suggestions, "
+                               "or drop a pin on the map instead.")
+            lat, lng, label = located
+            market = detect_market(f"{address} {label}", market)
+        query = {"address": address, "count": count, "within_km": within_km, "cuisine": cuisine,
+                 "price": price_levels, "min_rating": min_rating, "sort": sort}
+        # Rounded to ~10 m, so the same address typed or picked shares the cache.
+        cache_key = (f"nearby|{market.value}|{lat:.4f},{lng:.4f}|"
+                     f"{sorted((k, str(v).lower()) for k, v in query.items() if k != 'address')}")
         if cached := await self.store.get_cached(cache_key):
             log.info("cache hit", extra={"cache_key": cache_key})
             return ResultTable(**cached)
 
-        text = f"{cuisine} restaurants in {location}" if cuisine else f"restaurants in {location}"
-        candidates = await self.google.search(text, market, price_levels=price_levels, min_rating=min_rating, limit=20)
+        text = f"{cuisine} restaurant" if cuisine else "restaurant"
+        found = await self.google.search(text, market, price_levels=price_levels, min_rating=min_rating,
+                                         limit=20, center=(lat, lng), radius_m=within_km * 1000)
+        # Google's distance ranking is a bias, so measure and enforce the radius here.
+        candidates = sorted(
+            ((distance_km(lat, lng, p.lat, p.lng), p) for p in found
+             if p.lat is not None and p.lng is not None and p.business_status != "CLOSED_PERMANENTLY"),
+            key=lambda t: t[0],
+        )
+        candidates = [(d, p) for d, p in candidates if d <= within_km][:count]
         if not candidates:
-            raise NotFound("No restaurants matched those filters.")
-        # Shortlist on Google alone, then spend second-source API calls only on the shortlist.
-        candidates.sort(key=lambda p: bayesian(p.rating, p.review_count) or 0, reverse=True)
-        shortlist = candidates[: max(limit, self.settings.enrich_limit)]
-        # Tripadvisor bills per item, so only the restaurants likely to be shown get checked there.
-        rows = await asyncio.gather(*(
-            self._build_row(p, market, with_tripadvisor=i < limit) for i, p in enumerate(shortlist)
-        ))
-        rows = sorted(rows, key=lambda r: r.score or 0, reverse=True)[:limit]
+            filters = " with those filters" if (cuisine or price_levels or min_rating) else ""
+            raise NotFound(f"No restaurants{filters} within {within_km:g} km of {label}. Try a larger distance.")
+
+        rows = list(await asyncio.gather(*(self._build_row(p, market) for _, p in candidates)))
+        for row, (d, _) in zip(rows, candidates):
+            row.distance_km = round(d, 2)
+        if sort == "rating":
+            rows.sort(key=lambda r: r.score or 0, reverse=True)
         for i, r in enumerate(rows, 1):
             r.rank = i
         table = self._table(query, market, rows)
+        table.mode = "nearby"
+        table.center = Center(lat=lat, lng=lng, label=label, radius_km=within_km)
         await self.store.set_cached(cache_key, table.model_dump(mode="json"), self.settings.cache_ttl_hours)
         return table
 
-    async def autocomplete(self, text: str, kind: str, session_token: str | None = None) -> list[dict]:
+    async def _locate(self, address: str, place_id: str | None = None,
+                      session_token: str | None = None, region: str | None = None) -> tuple[float, float, str] | None:
+        """Coordinates for an address or area. Addresses don't move, so lookups are remembered
+        for a day and repeat searches skip the Google call. `region` ("US", "TW") resolves
+        ambiguous names like 信義區 within that country."""
+        loc_key = (place_id or "", address.strip().lower(), region or "")
+        hit = self._locate_cache.get(loc_key)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        located = await self.google.locate(address, place_id, session_token, region=region)
+        if located:
+            if len(self._locate_cache) > 5000:
+                self._locate_cache.clear()
+            self._locate_cache[loc_key] = (time.monotonic() + 86400, located)
+        return located
+
+    async def locate_point(self, address: str, place_id: str | None = None,
+                           session_token: str | None = None) -> tuple[float, float, str] | None:
+        """For the map picker: move the pin to an address or cross streets."""
         self._require_google()
-        key = (kind, text.strip().lower())
+        return await self._locate(address, place_id, session_token)
+
+    async def _describe_point(self, lat: float, lng: float, market: Market) -> str | None:
+        """A readable address for a dropped pin (remembered for a day, like address lookups)."""
+        key = ("pin", f"{lat:.5f},{lng:.5f}", market.value)
+        hit = self._locate_cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            return hit[1]
+        label = await self.google.reverse_geocode(lat, lng, "zh-TW" if market == Market.tw else "en")
+        if label:
+            self._locate_cache[key] = (time.monotonic() + 86400, label)
+        return label
+
+    async def autocomplete(self, text: str, kind: str, session_token: str | None = None,
+                           near: str | None = None) -> list[dict]:
+        """Suggestions while typing. `near` (e.g. the Location field) makes Google favour that area
+        instead of wherever the person happens to be."""
+        self._require_google()
+        near = (near or "").strip()
+        key = (kind, text.strip().lower(), near.lower())
         now = time.monotonic()
         if (hit := self._suggest_cache.get(key)) and hit[0] > now:
             return hit[1]
-        results = await self.google.autocomplete(text.strip(), kind, session_token)
+        bias = None
+        if near:
+            try:
+                if located := await self._locate(near):
+                    bias = located[:2]
+            except Exception:
+                log.warning("couldn't locate the area for suggestions; using no bias", extra={"near": near})
+        results = await self.google.autocomplete(text.strip(), kind, session_token, bias=bias)
         if len(self._suggest_cache) > 2000:
             self._suggest_cache.clear()
         self._suggest_cache[key] = (now + 3600, results)
@@ -182,17 +322,22 @@ class ReviewService:
         new_reviews: list[Review] = list(place.reviews)
         michelin_label = None
 
-        if with_tripadvisor and self.tripadvisor and self.tripadvisor.enabled_for(market):
-            try:
-                ta = await self.tripadvisor.find(place.source_id, place.name, place.lat, place.lng, market)
-            except Exception:
-                log.exception("tripadvisor lookup failed", extra={"restaurant": place.name})
-                ta = None
-            if ta:
-                ratings.append(SourceRating(source=ta.source, source_id=ta.source_id, name=ta.name,
-                                            rating=ta.rating, review_count=ta.review_count, url=ta.url,
-                                            rating_image_url=ta.rating_image_url))
-                new_reviews += ta.reviews
+        status: dict[str, str] = {"google": "matched"}
+        if self.tripadvisor and self.tripadvisor.enabled_for(market):
+            if not with_tripadvisor:
+                status["tripadvisor"] = "not_checked"
+            else:
+                try:
+                    ta, status["tripadvisor"] = await self.tripadvisor.find(
+                        place.source_id, place.name, place.lat, place.lng, market, place.address)
+                except Exception:
+                    log.exception("tripadvisor lookup failed", extra={"restaurant": place.name})
+                    ta, status["tripadvisor"] = None, "error"
+                if ta:
+                    ratings.append(SourceRating(source=ta.source, source_id=ta.source_id, name=ta.name,
+                                                rating=ta.rating, review_count=ta.review_count, url=ta.url,
+                                                rating_image_url=ta.rating_image_url))
+                    new_reviews += ta.reviews
 
         if market == Market.us and self.yelp.enabled:
             try:
@@ -200,6 +345,8 @@ class ReviewService:
             except Exception:
                 log.exception("yelp lookup failed", extra={"restaurant": place.name})
                 yp = None
+                status["yelp"] = "error"
+            status.setdefault("yelp", "matched" if yp else "no_match")
             if yp:
                 ratings.append(SourceRating(source=yp.source, source_id=yp.source_id, name=yp.name,
                                             rating=yp.rating, review_count=yp.review_count, url=yp.url))
@@ -219,13 +366,19 @@ class ReviewService:
             lat=place.lat,
             lng=place.lng,
             price=price_label(place.price_level),
+            price_range=place.price_range,
+            hours=place.hours,
+            business_status=place.business_status,
             cuisine=place.cuisine,
             ratings=ratings,
             all_time_rating=_weighted_rating(ratings),
             recent_3_months=_recent(all_reviews),
             michelin=michelin_label,
             top_dishes=extract_dishes(all_reviews),
-            links=_manual_links(place, market, has_yelp_rating=any(r.source == "yelp" for r in ratings)),
+            links=_manual_links(place, market, has_yelp_rating=any(r.source == "yelp" for r in ratings),
+                                in_michelin_list=michelin_label is not None),
+            directions_url=_directions_url(place),
+            source_status=status,
             score=_score(ratings),
         )
 
@@ -250,14 +403,51 @@ class ReviewService:
         )
 
 
-def _manual_links(place: Place, market: Market, has_yelp_rating: bool) -> list[Link]:
+def distance_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Straight-line distance between two points on Earth."""
+    from math import asin, cos, radians, sin, sqrt
+    dlat, dlng = radians(lat2 - lat1), radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return 6371 * 2 * asin(sqrt(a))
+
+
+def _matches_by_name(name: str, places: list[Place], threshold: float = 0.6) -> list[Place]:
+    """Every place whose name matches, best match first (several when it's a chain)."""
+    scored = [(similarity(name, p.name), i, p) for i, p in enumerate(places)]
+    return [p for s, i, p in sorted(scored, key=lambda t: (-t[0], t[1])) if s >= threshold]
+
+
+def _best_by_name(name: str, places: list[Place], threshold: float = 0.6) -> Place | None:
+    best = max(places, key=lambda p: similarity(name, p.name), default=None)
+    return best if best and similarity(name, best.name) >= threshold else None
+
+
+def _directions_url(place: Place) -> str:
+    """A Google Maps directions link (free, no key). Google Maps starts from the viewer's own
+    location and lets them pick driving, transit, walking or cycling; on phones it opens the app."""
+    params = {"api": "1", "destination": f"{place.name}, {place.address}".strip(", ")}
+    if place.source == "google" and place.source_id:
+        params["destination_place_id"] = place.source_id
+    return f"https://www.google.com/maps/dir/?{urlencode(params)}"
+
+
+MICHELIN_SEARCH = {Market.us: "https://guide.michelin.com/us/en/search", Market.tw: "https://guide.michelin.com/tw/zh_TW/search"}
+
+
+def _manual_links(place: Place, market: Market, has_yelp_rating: bool, in_michelin_list: bool = False) -> list[Link]:
     """Links the person opens themselves: free, and within each site's normal use."""
-    if market != Market.us or has_yelp_rating:
-        return []  # Yelp has little Taiwan coverage; with a paid key the rating is already shown.
-    # Street address narrows the search to the right branch; fall back to name only.
-    loc = place.address.replace(", USA", "").replace(", United States", "")
-    params = urlencode({"find_desc": place.name, "find_loc": loc} if loc else {"find_desc": place.name})
-    return [Link(label="See on Yelp", url=f"https://www.yelp.com/search?{params}")]
+    links = []
+    if not in_michelin_list:
+        # Michelin has no API; this searches the Guide's own site for the restaurant.
+        links.append(Link(label="Check Michelin Guide",
+                          url=f"{MICHELIN_SEARCH[market]}?{urlencode({'q': place.name})}"))
+    if market == Market.us and not has_yelp_rating:
+        # Yelp has little Taiwan coverage; with a paid key the rating is already shown.
+        # Street address narrows the search to the right branch; fall back to name only.
+        loc = place.address.replace(", USA", "").replace(", United States", "")
+        params = urlencode({"find_desc": place.name, "find_loc": loc} if loc else {"find_desc": place.name})
+        links.append(Link(label="See on Yelp", url=f"https://www.yelp.com/search?{params}"))
+    return links
 
 
 def _weighted_rating(ratings: list[SourceRating]) -> float | None:

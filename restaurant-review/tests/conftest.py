@@ -99,23 +99,45 @@ def mock_apis():
             side_effect=lambda req: Response(200, json=GOOGLE_US["places"][0]) if req.url.path.endswith("/g1")
             else Response(404, json={"error": {"code": 404}})
         )
-        # Tripadvisor / Terra (routes 5-7)
+        # Tripadvisor / Terra: 5 nearby, 6 details, 7 reviews, 8 name search
         router.get(f"{TA}/locations/nearby").mock(side_effect=_ta_nearby)
         router.get(url__regex=rf"{TA}/locations/\d+(\?|$)").mock(side_effect=_ta_details)
         router.get(url__regex=rf"{TA}/locations/\d+/reviews").mock(return_value=Response(200, json=TA_REVIEWS()))
+        router.get(f"{TA}/locations/search").mock(side_effect=_ta_search)
         yield router
 
 
 TA = "https://terra.tripadvisor.com/api"
 
 
-def ta_location(loc_id, names, distance_km, rating=4.5, count=1320):
-    return {
-        "id": loc_id, "geo_id": 60878, "names": [{"value": n, "locale": "en"} for n in names],
-        "addresses": [], "distance_kilometers": distance_km, "distance_miles": distance_km * 0.62,
+def ta_location(loc_id, names, distance_km=None, rating=4.5, count=1320, lat=None, lng=None):
+    loc = {
+        "id": loc_id, "geo_id": 60878, "names": [{"value": n, "locale": "en"} for n in names], "addresses": [],
         "traveler_ratings": {"overall": {"rating": rating, "count": count,
                                          "icon_url": "https://static.tacdn.com/img2/ratings/traveler/ss4.5.svg"}},
     }
+    if distance_km is not None:  # only nearby results carry a distance
+        loc.update(distance_kilometers=distance_km, distance_miles=distance_km * 0.62)
+    if lat is not None:
+        loc["coordinates"] = {"latitude": lat, "longitude": lng}
+    return loc
+
+
+# Valley Fair mall, Santa Clara: Din Tai Fung is upstairs, and other restaurants are nearer the pin.
+DTF_SC = (37.3256, -121.9455)
+
+
+def _ta_search(req):
+    q = req.url.params["query"]
+    results = {
+        "Noodle House": [ta_location(100, ["Noodle House"], lat=47.6001, lng=-122.3001)],
+        "Din Tai Fung": [
+            ta_location(501, ["Din Tai Fung"], lat=34.1453, lng=-118.2556, count=4100),   # Glendale branch
+            ta_location(500, ["Din Tai Fung"], lat=37.3253, lng=-121.9450, count=2200),   # Santa Clara
+        ],
+        "Far Away Ramen": [ta_location(600, ["Far Away Ramen"], lat=40.71, lng=-74.0)],
+    }.get(q, [])
+    return Response(200, json={"data": results[: int(req.url.params.get("size", 20))]})
 
 
 def _ta_nearby(req):
@@ -126,6 +148,10 @@ def _ta_nearby(req):
             ta_location(100, ["Noodle House"], 0.02),
             ta_location(400, ["Corner Coffee"], 0.15),
         ], "pagination": {"page": 1, "size": 3, "total_elements": 2, "total_pages": 1}})
+    if lat == str(DTF_SC[0]):
+        # The 3 nearest places in the mall, none of them Din Tai Fung.
+        return Response(200, json={"data": [ta_location(700 + i, [n], 0.02 + i / 100)
+                                            for i, n in enumerate(["Pressed Juicery", "Sushi Bar", "Tea Stop"])]})
     if lat == "25.03":
         # English name only, 10 m away: should match 範例小籠包 by position.
         return Response(200, json={"data": [ta_location(300, ["Example Dumpling Hall"], 0.01)]})

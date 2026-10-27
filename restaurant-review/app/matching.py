@@ -21,3 +21,8 @@ def similarity(a: str, b: str) -> float:
     if na in nb or nb in na:
         return 0.9
     return SequenceMatcher(None, na, nb).ratio()
+
+
+def has_cjk(text: str) -> bool:
+    """True if the text contains Chinese characters."""
+    return any("一" <= ch <= "鿿" for ch in text or "")

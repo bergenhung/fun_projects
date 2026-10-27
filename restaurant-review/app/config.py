@@ -39,8 +39,6 @@ class Settings(BaseSettings):
 
     # How long a search result is reused before calling the review APIs again.
     cache_ttl_hours: float = 6.0
-    # How many candidates /top enriches with a second source (each one costs API calls).
-    enrich_limit: int = 10
 
     # Optional: if set, callers must send this value in the X-API-Key header.
     service_api_key: str = ""
